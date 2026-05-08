@@ -24,12 +24,9 @@ def preprocess_image(image_path):
     face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
     face = face.astype("float32")
 
-    # Standardize per image (zero mean, unit variance)
-    # This is the correct preprocessing for FaceNet —
-    # simple /255 scaling loses discriminative power.
     mean = np.mean(face)
     std  = np.std(face)
-    std  = max(std, 1.0 / np.sqrt(face.size))   # avoid div-by-zero
+    std  = max(std, 1.0 / np.sqrt(face.size))
     face = (face - mean) / std
 
     return np.expand_dims(face, axis=0)
@@ -44,7 +41,6 @@ def generate_embedding(interpreter, input_data):
 
     embedding = interpreter.get_tensor(output_details[0]["index"])[0]
 
-    # L2-normalize so cosine similarity == dot product
     norm = np.linalg.norm(embedding)
     if norm > 0:
         embedding = embedding / norm
@@ -178,14 +174,14 @@ def process_all_faces():
                 updated_at=None,
             )
 
-            print(f"✔ Embedding created: {embedding_path}")
+            print(f" Embedding created: {embedding_path}")
             success_count += 1
 
         except Exception as e:
-            print(f"❌ Failed for {image_path}: {e}")
+            print(f" Failed for {image_path}: {e}")
             fail_count += 1
 
-    print(f"\n✅ Embedding generation complete — {success_count} success, {fail_count} failed")
+    print(f"\n Embedding generation complete — {success_count} success, {fail_count} failed")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,8 @@
-from app.firebase_client import get_firestore
-from app.db import get_connection
+from app.device_api import upload_log
+from app.db import get_connection, enqueue_sync
 
 
 def upload_pending_logs():
-    firestore_db = get_firestore()
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -24,12 +23,10 @@ def upload_pending_logs():
         conn.close()
         return
 
-    print("=== Uploading pending logs ===")
+    print("=== Uploading pending logs via API ===")
 
     for row in rows:
         log_id = str(row["id"])
-        home_id = row["home_id"]
-        device_id = row["device_id"]
 
         log_data = {
             "homeId": row["home_id"],
@@ -46,13 +43,7 @@ def upload_pending_logs():
         }
 
         try:
-            firestore_db.collection("homes") \
-                .document(home_id) \
-                .collection("devices") \
-                .document(device_id) \
-                .collection("logs") \
-                .document(log_id) \
-                .set(log_data)
+            upload_log(log_id, log_data)
 
             cursor.execute("""
                 UPDATE access_logs
@@ -61,13 +52,19 @@ def upload_pending_logs():
             """, (row["id"],))
 
             conn.commit()
-            print(f"✔ Uploaded log {log_id} to Firebase")
+            print(f" Uploaded log {log_id} via API")
 
         except Exception as e:
-            print(f"❌ Failed to upload log {log_id}: {e}")
+            print(f" Failed to upload log {log_id}: {e}")
+
+            try:
+                enqueue_sync("log", log_id, "upload")
+                print(f" Queued log {log_id} for retry")
+            except Exception as queue_error:
+                print(f" Could not queue log {log_id}: {queue_error}")
 
     conn.close()
-    print("✅ Log upload process complete")
+    print("Log upload process complete")
 
 
 if __name__ == "__main__":

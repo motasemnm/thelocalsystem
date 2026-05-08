@@ -7,6 +7,10 @@ FACES_DIR = f"{BASE_DIR}/faces"
 EMBEDDINGS_DIR = f"{BASE_DIR}/embeddings"
 LOGS_DIR = f"{BASE_DIR}/logs"
 
-SERVICE_ACCOUNT_PATH = f"{CONFIG_DIR}/serviceAccountKey.json"
+DEVICE_CONFIG_PATH = f"{CONFIG_DIR}/device_config.json"
 
-BUCKET_NAME = "myapp-f83d3.firebasestorage.app" 
+FUNCTIONS_BASE_URL = "https://devicesynchome-z3tnf2pdla-uc.a.run.app"
+
+SERVICE_ACCOUNT_PATH = None
+BUCKET_NAME = None
+

@@ -6,10 +6,7 @@ from app.face_utils import get_cropped_face_from_path
 from app.config import MODELS_DIR, EMBEDDINGS_DIR
 
 
-# Distance below this = same person.
-# With L2-normalized embeddings + standardized input, 0.7 is a good
-# starting point. Lower = stricter (fewer false accepts).
-MATCH_THRESHOLD = 0.7
+MATCH_THRESHOLD = 0.8
 
 
 def load_facenet():
