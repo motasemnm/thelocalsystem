@@ -23,7 +23,9 @@ def send_security_alert(
 def check_tampering_and_alert(home_id, device_id):
     print("=== Checking blockchain/log integrity ===")
 
-    result = verify_chain(home_id)
+    # Important:
+    # Verify only logs for the current home_id + device_id.
+    result = verify_chain(home_id, device_id)
 
     tampered = False
     message = None

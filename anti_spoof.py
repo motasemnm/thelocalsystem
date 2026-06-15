@@ -7,7 +7,7 @@ from app.config import MODELS_DIR
 from app.face_utils import get_cropped_face_from_path
 
 MODEL_PATH = os.path.join(MODELS_DIR, "anti_spoofing.tflite")
-REAL_THRESHOLD = 0.30
+REAL_THRESHOLD = 0.90
 
 
 def load_model():

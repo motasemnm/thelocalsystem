@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import tempfile
 import time
+import threading
 
 from app.config_utils import load_device_config
 from app.home_sync import sync_selected_home, set_device_offline
@@ -17,12 +18,133 @@ from app.cache_cleanup import cleanup_old_local_cache
 from app.security_alerts import check_tampering_and_alert
 
 
-COOLDOWN_SECONDS = 6
-FACE_CONFIRM_FRAMES = 4
-RESULT_DISPLAY_SEC = 4
+COOLDOWN_SECONDS = 4
+FACE_CONFIRM_FRAMES = 3
+RESULT_DISPLAY_SEC = 2
+
 CAMERA_SOURCE = "/dev/video0"
-REFRESH_SECONDS = 60
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_FPS = 30
+CAMERA_BUFFER_SIZE = 1
+CAMERA_FOURCC = "MJPG"
+
+REFRESH_SECONDS = 600
 BLINK_SECONDS = 5
+
+SYNC_LOCK = threading.Lock()
+REFRESH_RUNNING = False
+
+
+class CameraStream:
+    def __init__(self, source):
+        self.source = source
+        self.cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*CAMERA_FOURCC))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
+
+        if not self.cap.isOpened():
+            raise Exception(f"Could not open camera source: {source}")
+
+        actual_width = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_height = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        actual_buffer = self.cap.get(cv2.CAP_PROP_BUFFERSIZE)
+
+        print("\n=== Camera Settings ===")
+        print(f"Source: {CAMERA_SOURCE}")
+        print(f"Resolution: {actual_width:.0f} x {actual_height:.0f}")
+        print(f"FPS: {actual_fps:.2f}")
+        print(f"Buffer size: {actual_buffer:.0f}")
+        print(f"FOURCC: {CAMERA_FOURCC}")
+        print("=======================\n")
+
+        self.frame = None
+        self.running = True
+        self.lock = threading.Lock()
+
+        self.thread = threading.Thread(target=self._update, daemon=True)
+        self.thread.start()
+
+        time.sleep(0.3)
+
+    def _update(self):
+        while self.running:
+            try:
+                ret, frame = self.cap.read()
+
+                if ret and frame is not None:
+                    with self.lock:
+                        self.frame = frame
+                else:
+                    time.sleep(0.05)
+
+            except Exception as e:
+                print(f"Camera read error, retrying: {e}")
+                time.sleep(0.2)
+
+    def read(self):
+        with self.lock:
+            if self.frame is None:
+                return None
+            return self.frame.copy()
+
+    def stop(self):
+        self.running = False
+
+        try:
+            self.thread.join(timeout=1)
+        except Exception:
+            pass
+
+        self.cap.release()
+
+
+def upload_logs_background():
+    def worker():
+        if not SYNC_LOCK.acquire(blocking=False):
+            print("Log upload skipped because another sync task is running.")
+            return
+
+        try:
+            upload_pending_logs()
+        except Exception as e:
+            print(f"Background log upload error: {e}")
+        finally:
+            SYNC_LOCK.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def refresh_cache_background(home_id, device_id):
+    global REFRESH_RUNNING
+
+    if REFRESH_RUNNING:
+        print("Refresh skipped because it is already running.")
+        return
+
+    def worker():
+        global REFRESH_RUNNING
+        REFRESH_RUNNING = True
+
+        if not SYNC_LOCK.acquire(blocking=False):
+            print("Refresh skipped because another sync task is running.")
+            REFRESH_RUNNING = False
+            return
+
+        try:
+            refresh_all_cloud_cache(home_id, device_id)
+        except Exception as e:
+            print(f"Background refresh error: {e}")
+        finally:
+            SYNC_LOCK.release()
+            REFRESH_RUNNING = False
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def get_user_name(user_uid):
@@ -68,7 +190,7 @@ def check_all_local_blockchains(device_id):
         print(f"Blockchain check error, system will continue: {e}")
 
 
-def detect_blink_simple(cap):
+def detect_blink_simple(camera):
     print("Checking blink...")
 
     eye_cascade = cv2.CascadeClassifier(
@@ -85,8 +207,9 @@ def detect_blink_simple(cap):
     start_time = time.time()
 
     while time.time() - start_time < BLINK_SECONDS:
-        ret, frame = cap.read()
-        if not ret or frame is None:
+        frame = camera.read()
+
+        if frame is None:
             continue
 
         frame = cv2.flip(frame, 1)
@@ -109,6 +232,7 @@ def detect_blink_simple(cap):
 
             if eyes_closed_after_open:
                 blink_detected = True
+
                 cv2.putText(
                     frame,
                     "Blink detected!",
@@ -118,8 +242,9 @@ def detect_blink_simple(cap):
                     (0, 255, 0),
                     2,
                 )
+
                 cv2.imshow("Smart Home Auth", frame)
-                cv2.waitKey(500)
+                cv2.waitKey(300)
                 break
 
         elif eyes_were_open and eyes_now == 0:
@@ -146,7 +271,9 @@ def detect_blink_simple(cap):
         )
 
         cv2.imshow("Smart Home Auth", frame)
-        cv2.waitKey(1)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            return False
 
     return blink_detected
 
@@ -225,14 +352,15 @@ def show_result_screen(frame_shape, granted, name=None):
             )
 
         cv2.imshow("Smart Home Auth", screen)
-        cv2.waitKey(1)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
 
 def refresh_all_cloud_cache(home_id, device_id):
     try:
         print("\n=== Auto refresh: cache + cloud data + AI models ===")
 
-        # Check blockchain first.
         print("\n=== Checking blockchain/log integrity ===")
         check_all_local_blockchains(device_id)
 
@@ -249,8 +377,8 @@ def refresh_all_cloud_cache(home_id, device_id):
         print(f"Auto refresh skipped/offline: {e}")
 
 
-def _process_frame(frame, home_id, device_id, cap):
-    blink_ok = detect_blink_simple(cap)
+def _process_frame(frame, home_id, device_id, camera):
+    blink_ok = detect_blink_simple(camera)
 
     if not blink_ok:
         print("Blink not detected → spoof / no liveness")
@@ -267,7 +395,7 @@ def _process_frame(frame, home_id, device_id, cap):
             spoof_result="fake",
         )
 
-        upload_pending_logs()
+        upload_logs_background()
         return
 
     print("Blink detected → continue")
@@ -325,7 +453,7 @@ def _process_frame(frame, home_id, device_id, cap):
                 spoof_result=spoof_result,
             )
 
-        upload_pending_logs()
+        upload_logs_background()
 
     except Exception as e:
         print(f"Processing error: {e}")
@@ -336,115 +464,116 @@ def _process_frame(frame, home_id, device_id, cap):
 
 
 def run_camera(home_id, device_id):
-    cap = cv2.VideoCapture(CAMERA_SOURCE, cv2.CAP_V4L2)
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-
-    if not cap.isOpened():
-        raise Exception(f"Could not open camera source: {CAMERA_SOURCE}")
+    camera = CameraStream(CAMERA_SOURCE)
 
     detector = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     )
 
     if detector.empty():
+        camera.stop()
         raise Exception("Could not load OpenCV face detector.")
 
     print("\nCamera is running — press Q to quit\n")
 
     last_decision_time = 0
     confirm_count = 0
-    last_refresh_time = 0
+    last_refresh_time = time.time()
 
-    while True:
-        ret, frame = cap.read()
+    try:
+        while True:
+            frame = camera.read()
 
-        if not ret or frame is None:
-            print("Failed to read frame — retrying...")
-            time.sleep(0.5)
-            continue
+            if frame is None:
+                print("Waiting for camera frame...")
+                time.sleep(0.1)
+                continue
 
-        frame = cv2.flip(frame, 1)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame = cv2.flip(frame, 1)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        faces = detector.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(60, 60),
-        )
-
-        face_detected = len(faces) > 0
-
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-        now = time.time()
-
-        if now - last_refresh_time >= REFRESH_SECONDS:
-            refresh_all_cloud_cache(home_id, device_id)
-            last_refresh_time = now
-
-        in_cooldown = (now - last_decision_time) < COOLDOWN_SECONDS
-
-        if in_cooldown:
-            remaining = int(COOLDOWN_SECONDS - (now - last_decision_time))
-
-            cv2.putText(
-                frame,
-                f"Please wait... {remaining}s",
-                (10, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 165, 255),
-                2,
+            faces = detector.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(60, 60),
             )
 
-            confirm_count = 0
+            face_detected = len(faces) > 0
 
-        elif face_detected:
-            confirm_count += 1
+            for (x, y, w, h) in faces:
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-            cv2.putText(
-                frame,
-                f"Hold still... ({confirm_count}/{FACE_CONFIRM_FRAMES})",
-                (10, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 0),
-                2,
-            )
+            now = time.time()
 
-        else:
-            confirm_count = 0
+            if now - last_refresh_time >= REFRESH_SECONDS:
+                refresh_cache_background(home_id, device_id)
+                last_refresh_time = now
 
-            cv2.putText(
-                frame,
-                "Scanning for face...",
-                (10, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (200, 200, 200),
-                2,
-            )
+            in_cooldown = (now - last_decision_time) < COOLDOWN_SECONDS
 
-        cv2.imshow("Smart Home Auth", frame)
+            if in_cooldown:
+                remaining = int(COOLDOWN_SECONDS - (now - last_decision_time))
 
-        if face_detected and not in_cooldown and confirm_count >= FACE_CONFIRM_FRAMES:
-            confirm_count = 0
-            last_decision_time = time.time()
+                cv2.putText(
+                    frame,
+                    f"Please wait... {remaining}s",
+                    (10, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (0, 165, 255),
+                    2,
+                )
 
-            print("\nFace confirmed — blink challenge starting...")
-            _process_frame(frame.copy(), home_id, device_id, cap)
+                confirm_count = 0
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            print("\nShutting down...")
-            break
+            elif face_detected:
+                confirm_count += 1
 
-    cap.release()
-    cv2.destroyAllWindows()
+                cv2.putText(
+                    frame,
+                    f"Hold still... ({confirm_count}/{FACE_CONFIRM_FRAMES})",
+                    (10, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (0, 255, 0),
+                    2,
+                )
+
+            else:
+                confirm_count = 0
+
+                cv2.putText(
+                    frame,
+                    "Scanning for face...",
+                    (10, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (200, 200, 200),
+                    2,
+                )
+
+            cv2.imshow("Smart Home Auth", frame)
+
+            if face_detected and not in_cooldown and confirm_count >= FACE_CONFIRM_FRAMES:
+                confirm_count = 0
+                last_decision_time = time.time()
+
+                print("\nFace confirmed — blink challenge starting...")
+
+                try:
+                    _process_frame(frame.copy(), home_id, device_id, camera)
+                except Exception as e:
+                    print(f"Attempt failed, camera will continue: {e}")
+                    time.sleep(1)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                print("\nShutting down...")
+                break
+
+    finally:
+        camera.stop()
+        cv2.destroyAllWindows()
 
 
 def main():

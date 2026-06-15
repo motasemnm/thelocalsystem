@@ -5,11 +5,9 @@ from datetime import datetime, timezone
 from app.device_api import call_function
 from app.db import (
     get_connection,
-    get_last_batch_hash,
     insert_blockchain_batch,
     update_batch_status,
     insert_blockchain_audit,
-    get_unanchored_logs,
     mark_logs_batched,
 )
 
@@ -43,7 +41,13 @@ def compute_batch_hash(log_hashes: list, previous_batch_hash: str | None) -> str
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
 
-def get_all_logs_for_home(home_id: str) -> list:
+def get_all_logs_for_home_device(home_id: str, device_id: str) -> list:
+    """
+    Return logs only for the selected home and selected device.
+
+    This makes blockchain validation independent for each home/device.
+    Old logs from another home or device will not be checked here.
+    """
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -57,14 +61,101 @@ def get_all_logs_for_home(home_id: str) -> list:
                blockchain_tx_id, blockchain_anchor_time
         FROM access_logs
         WHERE home_id = ?
+          AND device_id = ?
         ORDER BY id ASC
         """,
-        (home_id,),
+        (home_id, device_id),
     )
 
     rows = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return rows
+
+
+def get_unanchored_logs_for_home_device(home_id: str, device_id: str, limit=50) -> list:
+    """
+    Return unbatched logs only for the selected home/device.
+    This keeps blockchain batches independent per device.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM access_logs
+        WHERE home_id = ?
+          AND device_id = ?
+          AND batch_id IS NULL
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (home_id, device_id, limit),
+    )
+
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_last_batch_hash_for_home_device(home_id: str, device_id: str) -> str | None:
+    """
+    Get the latest batch hash for this exact home/device.
+
+    blockchain_batches does not store device_id directly, so we find batches
+    through access_logs.batch_id for this home/device.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT b.batch_hash
+        FROM blockchain_batches b
+        WHERE b.id IN (
+            SELECT DISTINCT batch_id
+            FROM access_logs
+            WHERE home_id = ?
+              AND device_id = ?
+              AND batch_id IS NOT NULL
+        )
+        ORDER BY b.created_at DESC
+        LIMIT 1
+        """,
+        (home_id, device_id),
+    )
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return row["batch_hash"] if row else None
+
+
+def get_batches_for_home_device(home_id: str, device_id: str) -> list:
+    """
+    Return anchored batches connected to logs for this specific home/device.
+
+    This avoids validating unrelated batches from another home/device.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT DISTINCT b.id, b.batch_hash, b.blockchain_status
+        FROM blockchain_batches b
+        INNER JOIN access_logs l ON l.batch_id = b.id
+        WHERE l.home_id = ?
+          AND l.device_id = ?
+          AND b.blockchain_status = 'anchored'
+        ORDER BY b.created_at ASC
+        """,
+        (home_id, device_id),
+    )
+
+    batches = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return batches
 
 
 def get_firebase_anchor(batch_id: str) -> dict | None:
@@ -86,21 +177,30 @@ def get_firebase_anchor(batch_id: str) -> dict | None:
         return None
 
 
-def verify_chain(home_id: str) -> dict:
-    logs = get_all_logs_for_home(home_id)
+def verify_chain(home_id: str, device_id: str) -> dict:
+    """
+    Verify the local access log chain for one specific home/device.
+
+    This prevents an old broken chain from another home/device from affecting
+    the currently configured local system.
+    """
+    logs = get_all_logs_for_home_device(home_id, device_id)
 
     if not logs:
-        print("No logs found for this home.")
+        print("No logs found for this home/device.")
         return {
             "valid": True,
+            "home_id": home_id,
+            "device_id": device_id,
             "total": 0,
             "checked": 0,
             "broken_at_log_id": None,
             "firebase_anchor_valid": None,
-            "reason": "No logs found for this home.",
+            "reason": "No logs found for this home/device.",
         }
 
     print(f"Verifying local chain for home: {home_id}")
+    print(f"Verifying local chain for device: {device_id}")
     print(f"Total logs found: {len(logs)}")
 
     previous_hash = None
@@ -122,6 +222,8 @@ def verify_chain(home_id: str) -> dict:
 
             return {
                 "valid": False,
+                "home_id": home_id,
+                "device_id": device_id,
                 "total": len(logs),
                 "checked": index + 1,
                 "broken_at_log_id": log_id,
@@ -143,6 +245,8 @@ def verify_chain(home_id: str) -> dict:
 
             return {
                 "valid": False,
+                "home_id": home_id,
+                "device_id": device_id,
                 "total": len(logs),
                 "checked": index + 1,
                 "broken_at_log_id": log_id,
@@ -157,27 +261,14 @@ def verify_chain(home_id: str) -> dict:
 
     print("Verifying Firebase anchors via API...")
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT id, batch_hash, blockchain_status
-        FROM blockchain_batches
-        WHERE home_id = ?
-          AND blockchain_status = 'anchored'
-        ORDER BY created_at ASC
-        """,
-        (home_id,),
-    )
-
-    batches = [dict(row) for row in cursor.fetchall()]
-    conn.close()
+    batches = get_batches_for_home_device(home_id, device_id)
 
     if not batches:
-        print("ℹ No anchored batches found — skipping Firebase anchor check.")
+        print("ℹ No anchored batches found for this home/device — skipping Firebase anchor check.")
         return {
             "valid": True,
+            "home_id": home_id,
+            "device_id": device_id,
             "total": len(logs),
             "checked": len(logs),
             "broken_at_log_id": None,
@@ -210,6 +301,8 @@ def verify_chain(home_id: str) -> dict:
 
     return {
         "valid": True,
+        "home_id": home_id,
+        "device_id": device_id,
         "total": len(logs),
         "checked": len(logs),
         "broken_at_log_id": None,
@@ -218,20 +311,25 @@ def verify_chain(home_id: str) -> dict:
     }
 
 
-def create_batch(home_id: str) -> dict | None:
-    logs = get_unanchored_logs(home_id)
+def create_batch(home_id: str, device_id: str) -> dict | None:
+    """
+    Create a blockchain batch only for unanchored logs belonging to the
+    selected home/device.
+    """
+    logs = get_unanchored_logs_for_home_device(home_id, device_id)
 
     if not logs:
-        print("ℹ No unanchored logs to batch.")
+        print("ℹ No unanchored logs to batch for this home/device.")
         return None
 
     log_ids = [log["id"] for log in logs]
     log_hashes = [log["log_hash"] for log in logs]
 
-    previous_batch_hash = get_last_batch_hash(home_id)
+    previous_batch_hash = get_last_batch_hash_for_home_device(home_id, device_id)
     batch_hash = compute_batch_hash(log_hashes, previous_batch_hash)
 
     print(f"Creating batch for home {home_id}")
+    print(f"Creating batch for device {device_id}")
     print(f"Logs included : {log_ids}")
     print(f"Batch hash    : {batch_hash}")
     print(f"Previous batch: {previous_batch_hash}")
@@ -253,7 +351,7 @@ def create_batch(home_id: str) -> dict | None:
         batch_id=batch_id,
         action="batch_created",
         status="success",
-        message=f"Batch created with {len(log_ids)} logs.",
+        message=f"Batch created with {len(log_ids)} logs for device {device_id}.",
     )
 
     print(f"Batch created: {batch_id}")
@@ -261,6 +359,7 @@ def create_batch(home_id: str) -> dict | None:
     return {
         "batch_id": batch_id,
         "home_id": home_id,
+        "device_id": device_id,
         "batch_hash": batch_hash,
         "previous_batch_hash": previous_batch_hash,
         "log_count": len(log_ids),
@@ -351,7 +450,7 @@ def anchor_batch(batch_id: str) -> dict:
         }
 
 
-def get_status(home_id: str) -> dict:
+def get_status(home_id: str, device_id: str) -> dict:
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -362,26 +461,30 @@ def get_status(home_id: str) -> dict:
                SUM(CASE WHEN blockchain_status = 'anchored' THEN 1 ELSE 0 END) as anchored
         FROM access_logs
         WHERE home_id = ?
+          AND device_id = ?
         """,
-        (home_id,),
+        (home_id, device_id),
     )
 
     log_stats = dict(cursor.fetchone())
 
     cursor.execute(
         """
-        SELECT COUNT(*) as total_batches,
-               SUM(CASE WHEN blockchain_status = 'anchored' THEN 1 ELSE 0 END) as anchored_batches
-        FROM blockchain_batches
-        WHERE home_id = ?
+        SELECT COUNT(DISTINCT b.id) as total_batches,
+               SUM(CASE WHEN b.blockchain_status = 'anchored' THEN 1 ELSE 0 END) as anchored_batches
+        FROM blockchain_batches b
+        INNER JOIN access_logs l ON l.batch_id = b.id
+        WHERE l.home_id = ?
+          AND l.device_id = ?
         """,
-        (home_id,),
+        (home_id, device_id),
     )
 
     batch_stats = dict(cursor.fetchone())
     conn.close()
 
     print(f"Blockchain status for home: {home_id}")
+    print(f"Blockchain status for device: {device_id}")
     print(f"Total logs      : {log_stats['total']}")
     print(f"Unanchored logs : {log_stats['unanchored']}")
     print(f"Anchored logs   : {log_stats['anchored']}")
@@ -397,29 +500,47 @@ def get_status(home_id: str) -> dict:
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage:")
-        print("  python3 -m app.blockchain verify <home_id>")
-        print("  python3 -m app.blockchain batch  <home_id>")
+        print("  python3 -m app.blockchain verify <home_id> <device_id>")
+        print("  python3 -m app.blockchain batch  <home_id> <device_id>")
         print("  python3 -m app.blockchain anchor <batch_id>")
-        print("  python3 -m app.blockchain status <home_id>")
+        print("  python3 -m app.blockchain status <home_id> <device_id>")
         sys.exit(1)
 
     command = sys.argv[1].lower()
-    arg = sys.argv[2]
 
     if command == "verify":
-        result = verify_chain(arg)
+        if len(sys.argv) < 4:
+            print("Usage: python3 -m app.blockchain verify <home_id> <device_id>")
+            sys.exit(1)
+
+        home_id = sys.argv[2]
+        device_id = sys.argv[3]
+        result = verify_chain(home_id, device_id)
         print("\nResult:", result)
 
     elif command == "batch":
-        result = create_batch(arg)
+        if len(sys.argv) < 4:
+            print("Usage: python3 -m app.blockchain batch <home_id> <device_id>")
+            sys.exit(1)
+
+        home_id = sys.argv[2]
+        device_id = sys.argv[3]
+        result = create_batch(home_id, device_id)
         print("\nResult:", result)
 
     elif command == "anchor":
-        result = anchor_batch(arg)
+        batch_id = sys.argv[2]
+        result = anchor_batch(batch_id)
         print("\nResult:", result)
 
     elif command == "status":
-        result = get_status(arg)
+        if len(sys.argv) < 4:
+            print("Usage: python3 -m app.blockchain status <home_id> <device_id>")
+            sys.exit(1)
+
+        home_id = sys.argv[2]
+        device_id = sys.argv[3]
+        result = get_status(home_id, device_id)
         print("\nResult:", result)
 
     else:

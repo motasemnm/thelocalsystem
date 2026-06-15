@@ -46,27 +46,18 @@ def now_iso():
 
 
 def _clear_home_cache(home_id):
-    print(f"=== Clearing old local cache for home {home_id} ===")
+    print(f"Clearing old local cache for home {home_id}")
 
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Delete users connected to this home BEFORE deleting memberships.
-    # They will be downloaded again from Firebase during sync.
-    cursor.execute("""
-        DELETE FROM users
-        WHERE uid IN (
-            SELECT user_uid FROM memberships WHERE home_id = ?
-        )
-    """, (home_id,))
-
     cursor.execute(
-        "DELETE FROM memberships WHERE home_id = ?",
+        "DELETE FROM face_images WHERE home_id = ?",
         (home_id,),
     )
 
     cursor.execute(
-        "DELETE FROM face_images WHERE home_id = ?",
+        "DELETE FROM memberships WHERE home_id = ?",
         (home_id,),
     )
 
@@ -78,17 +69,17 @@ def _clear_home_cache(home_id):
 
     if os.path.exists(face_home_dir):
         shutil.rmtree(face_home_dir)
-        print(f" Deleted old face cache: {face_home_dir}")
+        print(f"Deleted old face cache: {face_home_dir}")
 
     if os.path.exists(embedding_home_dir):
         shutil.rmtree(embedding_home_dir)
-        print(f" Deleted old embedding cache: {embedding_home_dir}")
+        print(f"Deleted old embedding cache: {embedding_home_dir}")
 
-    print(" Old home cache cleared")
+    print("Old home cache cleared")
 
 
 def sync_selected_home(home_id, device_id):
-    print("\n=== Syncing home via API ===")
+    print("\nSyncing home via API")
 
     result = sync_home_data()
 
@@ -110,7 +101,7 @@ def sync_selected_home(home_id, device_id):
         last_synced_at=now_iso(),
     )
 
-    print(f" Home synced: {real_home_id}")
+    print(f"Home synced: {real_home_id}")
 
     insert_device(
         device_id=real_device_id,
@@ -122,10 +113,10 @@ def sync_selected_home(home_id, device_id):
         created_at=ts_to_str(device_data.get("createdAt")),
     )
 
-    print(f" Device synced: {real_device_id}")
+    print(f"Device synced: {real_device_id}")
 
     update_device_status("online")
-    print(" Device set to online via API")
+    print("Device set to online via API")
 
     for user in users:
         insert_user(
@@ -138,7 +129,7 @@ def sync_selected_home(home_id, device_id):
             updated_at=now_iso(),
         )
 
-        print(f" User synced: {user['uid']}")
+        print(f"User synced: {user['uid']}")
 
     for membership in memberships:
         user_uid = membership.get("userRefId")
@@ -150,7 +141,7 @@ def sync_selected_home(home_id, device_id):
         status = membership.get("status", "accepted")
 
         if not access or status != "accepted":
-            print(f"ℹ Skipped inactive membership: {user_uid}")
+            print(f"Skipped inactive membership: {user_uid}")
             continue
 
         insert_membership(
@@ -162,7 +153,7 @@ def sync_selected_home(home_id, device_id):
             created_at=ts_to_str(membership.get("createdAt")),
         )
 
-        print(f"✔ Membership synced: {user_uid}")
+        print(f"Membership synced: {user_uid}")
 
     for membership in memberships:
         user_uid = membership.get("userRefId")
@@ -178,13 +169,13 @@ def sync_selected_home(home_id, device_id):
             continue
 
         if not image_path:
-            print(f"ℹ No imagePath found for user: {user_uid}")
+            print(f"No imagePath found for user: {user_uid}")
             continue
 
         image_path = image_path.replace("\\", "/").lstrip("/")
 
         if image_path.endswith("/"):
-            print(f" imagePath is a folder, not a file: {image_path}")
+            print(f"imagePath is a folder, not a file: {image_path}")
             continue
 
         local_dir = os.path.join(
@@ -199,7 +190,7 @@ def sync_selected_home(home_id, device_id):
 
         try:
             download_file_from_storage(image_path, local_path)
-            print(f" Face downloaded: {local_path}")
+            print(f"Face downloaded: {local_path}")
 
             insert_face_image(
                 home_id=real_home_id,
@@ -215,14 +206,14 @@ def sync_selected_home(home_id, device_id):
             )
 
         except Exception as e:
-            print(f" Failed to download face for {user_uid}: {e}")
+            print(f"Failed to download face for {user_uid}: {e}")
 
-    print(" Home sync completed via API")
+    print("Home sync completed via API")
 
 
 def set_device_offline(home_id, device_id):
     update_device_status("offline")
-    print(" Device set to offline via API")
+    print("Device set to offline via API")
 
 
 if __name__ == "__main__":

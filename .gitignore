@@ -6,3 +6,7 @@ build/
 android/.gradle/
 ios/Pods/
 *.log
+__pycache__/
+*.pyc
+venv/
+.env
